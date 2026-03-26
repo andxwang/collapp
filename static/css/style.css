@@ -14,14 +14,14 @@
     --sidebar-text:     #e2e8f0;
     --sidebar-dim:      #94a3b8;
 
-    --main-bg:          #f1f5f9;
-    --canvas-bg:        #ffffff;
-    --tile-bg:          #e2e8f0;
+    --main-bg:          #191d3d;
+    --canvas-bg:        #28306b;
+    --tile-bg:          #464f94;
     --tile-border:      #cbd5e1;
     --tile-hover:       #ddd6fe;
 
-    --text:             #1e293b;
-    --text-secondary:   #64748b;
+    --text:             #ecf0f5;
+    --text-secondary:   #adb8c7;
     --danger:           #ef4444;
 
     --radius-sm:  6px;
