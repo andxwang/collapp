@@ -110,9 +110,10 @@ def generate_collage():
         image_paths.append(path)
 
     pos_tuples = [(int(p[0]), int(p[1]), int(p[2]), int(p[3])) for p in positions]
+    crops = data.get('crops', None)  # list of {zoom, panX, panY} per tile
 
     try:
-        collage = compose_collage(image_paths, pos_tuples, output_size)
+        collage = compose_collage(image_paths, pos_tuples, output_size, crops=crops)
     except Exception as e:
         return jsonify({'error': f'Failed to generate collage: {e}'}), 500
 

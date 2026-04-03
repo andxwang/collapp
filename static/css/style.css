@@ -356,6 +356,22 @@ body {
     display: block;
 }
 
+/* Cropped / zoomed image – JS sets explicit dimensions & position */
+.tile.has-crop img {
+    width: auto;
+    height: auto;
+    object-fit: fill;
+    position: absolute;
+}
+
+/* Grab cursors for pan-enabled tiles */
+.tile.has-crop {
+    cursor: grab;
+}
+.tile.has-crop.panning {
+    cursor: grabbing;
+}
+
 /* tile number badge */
 .tile-number {
     position: absolute;

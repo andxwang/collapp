@@ -162,6 +162,7 @@ class CollageApp {
         this.currentLayout = null;
         this.tiles       = [];   // {x, y, w, h} in OUTPUT coordinates
         this.tileImages  = {};   // index → {file, objectUrl, serverFilename}
+        this.tileCrops   = {};   // index → {zoom, panX, panY, naturalW, naturalH}
         this.dividers    = [];   // from layout definition
         this.outputWidth  = DEFAULT_WIDTH;
         this.outputHeight = DEFAULT_HEIGHT;
@@ -185,6 +186,11 @@ class CollageApp {
         this.activeTileIndex  = null; // which tile triggered file picker
         this.draggingDivider  = null;
         this.dragStartPos     = null;
+
+        // Pan interaction state
+        this.panningTile      = null;  // index of tile being panned
+        this.panStart         = null;  // {x, y, panX, panY}
+        this.panDidMove       = false; // distinguish click vs drag
 
         this.init();
     }
@@ -251,8 +257,14 @@ class CollageApp {
         });
 
         // Divider drag (document-level)
-        document.addEventListener('mousemove', e => this.onDividerDrag(e));
-        document.addEventListener('mouseup',   () => this.onDividerDragEnd());
+        document.addEventListener('mousemove', e => {
+            this.onDividerDrag(e);
+            this.onPanMove(e);
+        });
+        document.addEventListener('mouseup', e => {
+            this.onDividerDragEnd();
+            this.onPanEnd(e);
+        });
 
         // Also handle touch for mobile
         document.addEventListener('touchmove', e => {
@@ -261,8 +273,15 @@ class CollageApp {
                 const touch = e.touches[0];
                 this.onDividerDrag(touch);
             }
+            if (this.panningTile !== null) {
+                e.preventDefault();
+                this.onPanMove(e.touches[0]);
+            }
         }, { passive: false });
-        document.addEventListener('touchend', () => this.onDividerDragEnd());
+        document.addEventListener('touchend', e => {
+            this.onDividerDragEnd();
+            this.onPanEnd(e);
+        });
     }
 
     // ── Layout selection ────────────────────────────────────────
@@ -273,8 +292,10 @@ class CollageApp {
         // Keep any images that still fit the new tile count; clear extras
         const layout = LAYOUTS[layoutName];
         const newImages = {};
+        const newCrops  = {};
         for (let i = 0; i < layout.tileCount; i++) {
             if (this.tileImages[i]) newImages[i] = this.tileImages[i];
+            if (this.tileCrops[i])  newCrops[i]  = this.tileCrops[i];
         }
         // Revoke extras
         for (const key of Object.keys(this.tileImages)) {
@@ -283,6 +304,7 @@ class CollageApp {
             }
         }
         this.tileImages = newImages;
+        this.tileCrops  = newCrops;
 
         // Update active card
         document.querySelectorAll('.layout-card').forEach(card => {
@@ -367,7 +389,10 @@ class CollageApp {
         this.tiles.forEach((tile, idx) => {
             const p = this.toPreview(tile.x, tile.y, tile.w, tile.h);
             const el = document.createElement('div');
-            el.className = 'tile' + (this.tileImages[idx] ? ' has-image' : '');
+            const hasCrop = !!(this.tileImages[idx] && this.tileCrops[idx]);
+            el.className = 'tile'
+                + (this.tileImages[idx] ? ' has-image' : '')
+                + (hasCrop ? ' has-crop' : '');
             el.style.cssText = `left:${p.x}px;top:${p.y}px;width:${p.w}px;height:${p.h}px;`;
 
             // Badge
@@ -380,6 +405,11 @@ class CollageApp {
                 const img = document.createElement('img');
                 img.src = this.tileImages[idx].objectUrl;
                 img.draggable = false;
+
+                if (hasCrop) {
+                    this.applyCropStyle(img, this.tileCrops[idx], p.w, p.h);
+                }
+
                 el.appendChild(img);
 
                 const rm = document.createElement('button');
@@ -387,6 +417,27 @@ class CollageApp {
                 rm.innerHTML = '&times;';
                 rm.addEventListener('click', e => { e.stopPropagation(); this.removeImage(idx); });
                 el.appendChild(rm);
+
+                // Scroll-to-zoom
+                el.addEventListener('wheel', e => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    this.onTileZoom(idx, e.deltaY, e.deltaMode);
+                }, { passive: false });
+
+                // Pan start (mousedown)
+                el.addEventListener('mousedown', e => {
+                    if (e.button !== 0) return;
+                    // Don't start pan if clicking the remove button
+                    if (e.target.closest('.tile-remove')) return;
+                    e.preventDefault();
+                    this.onPanStart(idx, e);
+                });
+                // Touch pan start
+                el.addEventListener('touchstart', e => {
+                    if (e.target.closest('.tile-remove')) return;
+                    this.onPanStart(idx, e.touches[0]);
+                }, { passive: true });
             } else {
                 const ph = document.createElement('div');
                 ph.className = 'tile-placeholder';
@@ -398,15 +449,15 @@ class CollageApp {
                     </svg>
                     <span>Add Photo</span>`;
                 el.appendChild(ph);
+
+                // Click → file picker (only for empty tiles)
+                el.addEventListener('click', () => {
+                    this.activeTileIndex = idx;
+                    this.fileInput.click();
+                });
             }
 
-            // Click → file picker
-            el.addEventListener('click', () => {
-                this.activeTileIndex = idx;
-                this.fileInput.click();
-            });
-
-            // Drag-and-drop
+            // Drag-and-drop (file drop always works)
             el.addEventListener('dragover', e => { e.preventDefault(); el.classList.add('drag-over'); });
             el.addEventListener('dragleave', ()  => el.classList.remove('drag-over'));
             el.addEventListener('drop', e => {
@@ -528,6 +579,173 @@ class CollageApp {
         }
     }
 
+    // ── Crop helpers ─────────────────────────────────────────────
+
+    /** Compute displayed image dimensions & offsets for a crop state inside a tile. */
+    getCropGeometry(crop, tileW, tileH) {
+        const imgAspect  = crop.naturalW / crop.naturalH;
+        const tileAspect = tileW / tileH;
+
+        // "Cover" base size (zoom = 1)
+        let baseW, baseH;
+        if (tileAspect > imgAspect) {
+            baseW = tileW;
+            baseH = tileW / imgAspect;
+        } else {
+            baseH = tileH;
+            baseW = tileH * imgAspect;
+        }
+
+        const zoomW = baseW * crop.zoom;
+        const zoomH = baseH * crop.zoom;
+
+        const maxPanX = (zoomW - tileW) / 2;
+        const maxPanY = (zoomH - tileH) / 2;
+
+        const left = -maxPanX - crop.panX * maxPanX;
+        const top  = -maxPanY - crop.panY * maxPanY;
+
+        return { zoomW, zoomH, left, top, maxPanX, maxPanY };
+    }
+
+    /** Apply crop positioning to an <img> element. */
+    applyCropStyle(imgEl, crop, tileW, tileH) {
+        const g = this.getCropGeometry(crop, tileW, tileH);
+        imgEl.style.position  = 'absolute';
+        imgEl.style.objectFit = 'fill';
+        imgEl.style.width     = g.zoomW + 'px';
+        imgEl.style.height    = g.zoomH + 'px';
+        imgEl.style.left      = g.left  + 'px';
+        imgEl.style.top       = g.top   + 'px';
+    }
+
+    /** Fast-path: update only image style for a single tile without full re-render. */
+    updateTileCropStyle(tileIdx) {
+        const el = this.tileElements[tileIdx];
+        if (!el) return;
+        const img = el.querySelector('img');
+        if (!img || !this.tileCrops[tileIdx]) return;
+        const tile = this.tiles[tileIdx];
+        const p = this.toPreview(tile.x, tile.y, tile.w, tile.h);
+        this.applyCropStyle(img, this.tileCrops[tileIdx], p.w, p.h);
+    }
+
+    // ── Zoom (scroll wheel) ─────────────────────────────────────
+
+    onTileZoom(tileIdx, deltaY, deltaMode) {
+        const crop = this.tileCrops[tileIdx];
+        if (!crop) return;
+
+        // Normalise delta to pixels: line mode (*40), page mode (*800)
+        let delta = deltaY;
+        if (deltaMode === 1) delta *= 40;
+        else if (deltaMode === 2) delta *= 800;
+
+        // Scroll up (negative) → zoom in; scroll down → zoom out
+        // Use exponential step so each ~120px of delta ≈ 1.25× zoom
+        const step = -delta / 300;
+        const factor = Math.pow(1.3, step);
+        const newZoom = Math.max(1.0, Math.min(5.0, crop.zoom * factor));
+        crop.zoom = newZoom;
+
+        // Re-clamp pan so image still covers tile
+        this.clampPan(crop, tileIdx);
+        this.updateTileCropStyle(tileIdx);
+    }
+
+    clampPan(crop, tileIdx) {
+        // Use OUTPUT tile dimensions for threshold (avoids preview-scale rounding)
+        const tile = this.tiles[tileIdx];
+        const g = this.getCropGeometry({ ...crop, panX: 0, panY: 0 }, tile.w, tile.h);
+
+        if (g.maxPanX < 1) {
+            crop.panX = 0;
+        } else {
+            crop.panX = Math.max(-1, Math.min(1, crop.panX));
+        }
+        if (g.maxPanY < 1) {
+            crop.panY = 0;
+        } else {
+            crop.panY = Math.max(-1, Math.min(1, crop.panY));
+        }
+    }
+
+    // ── Pan (click & drag) ──────────────────────────────────────
+
+    onPanStart(tileIdx, event) {
+        const crop = this.tileCrops[tileIdx];
+        if (!crop) {
+            // No crop state yet → treat as click for file picker
+            return;
+        }
+        this.panningTile = tileIdx;
+        this.panDidMove  = false;
+        this.panStart    = {
+            x: event.clientX,
+            y: event.clientY,
+            panX: crop.panX,
+            panY: crop.panY,
+        };
+        if (this.tileElements[tileIdx]) {
+            this.tileElements[tileIdx].classList.add('panning');
+        }
+        document.body.style.userSelect = 'none';
+    }
+
+    onPanMove(event) {
+        if (this.panningTile === null) return;
+
+        const dx = event.clientX - this.panStart.x;
+        const dy = event.clientY - this.panStart.y;
+
+        if (!this.panDidMove && Math.abs(dx) < 3 && Math.abs(dy) < 3) return;
+        this.panDidMove = true;
+
+        const crop = this.tileCrops[this.panningTile];
+        if (!crop) return;
+
+        const tile = this.tiles[this.panningTile];
+        const p = this.toPreview(tile.x, tile.y, tile.w, tile.h);
+        const g = this.getCropGeometry({ ...crop, panX: 0, panY: 0 }, p.w, p.h);
+
+        // Also check output-coord geometry for whether panning is meaningful
+        const gOut = this.getCropGeometry({ ...crop, panX: 0, panY: 0 }, tile.w, tile.h);
+
+        // Convert pixel drag to normalised pan delta (only if there's real pan room)
+        if (gOut.maxPanX >= 1 && g.maxPanX > 0) {
+            crop.panX = Math.max(-1, Math.min(1, this.panStart.panX - dx / g.maxPanX));
+        } else {
+            crop.panX = 0;
+        }
+        if (gOut.maxPanY >= 1 && g.maxPanY > 0) {
+            crop.panY = Math.max(-1, Math.min(1, this.panStart.panY - dy / g.maxPanY));
+        } else {
+            crop.panY = 0;
+        }
+
+        this.updateTileCropStyle(this.panningTile);
+    }
+
+    onPanEnd(event) {
+        if (this.panningTile === null) return;
+
+        const idx = this.panningTile;
+        if (this.tileElements[idx]) {
+            this.tileElements[idx].classList.remove('panning');
+        }
+
+        // If no real drag happened, treat as a click → open file picker
+        if (!this.panDidMove) {
+            this.activeTileIndex = idx;
+            this.fileInput.click();
+        }
+
+        this.panningTile = null;
+        this.panStart    = null;
+        this.panDidMove  = false;
+        document.body.style.userSelect = '';
+    }
+
     // ── Image upload ────────────────────────────────────────────
 
     async uploadImage(tileIndex, file) {
@@ -559,8 +777,25 @@ class CollageApp {
                 serverFilename: data.filename,
             };
 
-            this.render();
-            this.updateExportButton();
+            // Load natural size and initialise crop state
+            const probe = new Image();
+            probe.onload = () => {
+                this.tileCrops[tileIndex] = {
+                    zoom: 1.0,
+                    panX: 0,
+                    panY: 0,
+                    naturalW: probe.naturalWidth,
+                    naturalH: probe.naturalHeight,
+                };
+                this.render();
+                this.updateExportButton();
+            };
+            probe.onerror = () => {
+                // Fallback: render without crop metadata
+                this.render();
+                this.updateExportButton();
+            };
+            probe.src = objectUrl;
         } catch (err) {
             URL.revokeObjectURL(objectUrl);
             this.showToast('Failed to upload image: ' + err.message, 'error');
@@ -572,6 +807,7 @@ class CollageApp {
         if (this.tileImages[index]) {
             URL.revokeObjectURL(this.tileImages[index].objectUrl);
             delete this.tileImages[index];
+            delete this.tileCrops[index];
             this.render();
             this.updateExportButton();
         }
@@ -590,6 +826,7 @@ class CollageApp {
 
         const images    = [];
         const positions = [];
+        const crops     = [];
 
         for (let i = 0; i < this.tiles.length; i++) {
             if (!this.tileImages[i]) {
@@ -599,6 +836,8 @@ class CollageApp {
             images.push(this.tileImages[i].serverFilename);
             const t = this.tiles[i];
             positions.push([t.x, t.y, t.w, t.h]);
+            const c = this.tileCrops[i] || { zoom: 1, panX: 0, panY: 0 };
+            crops.push({ zoom: c.zoom, panX: c.panX, panY: c.panY });
         }
 
         this.showLoading(true);
@@ -611,6 +850,7 @@ class CollageApp {
                     layout:    this.currentLayout,
                     images,
                     positions,
+                    crops,
                     width:     this.outputWidth,
                     height:    this.outputHeight,
                 }),
@@ -649,6 +889,7 @@ class CollageApp {
         this.currentLayout = null;
         this.tiles      = [];
         this.tileImages = {};
+        this.tileCrops  = {};
         this.dividers   = [];
 
         document.querySelectorAll('.layout-card').forEach(c => c.classList.remove('active'));
